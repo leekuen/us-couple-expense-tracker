@@ -727,8 +727,11 @@ async function openExpenseModal(localId, preset) {
 function closeModal() { $('#modalRoot').innerHTML = ''; }
 
 /* ---------- 截圖匯入（辨識在 claude.ai 完成，不需要 API key） ---------- */
-// 截圖時間若是台灣時間，請 Claude 換算成這個時區再填日期與時間。
-const IMPORT_TZ = 'America/New_York';
+// 截圖上的日期時間一律照銀行顯示的台灣時間填，不做時區換算。
+// 台新帳戶的截圖視為 Richart 卡：從支付方式選項中找名稱含 richart 的那個。
+function richartMethod() {
+  return state.methods.find((m) => normOptionText(m).includes('richart')) || '';
+}
 
 function normOptionText(s) { return String(s || '').replace(/[^\p{L}\p{N}]/gu, '').toLowerCase(); }
 
@@ -756,18 +759,18 @@ function buildImportPrompt() {
   return `我會附上一或多張消費截圖（信用卡通知、行動支付、收據、訂單截圖等）。請辨識每一筆「實際消費」，只輸出一個 JSON 陣列，不要輸出任何其他文字或說明。
 
 每筆物件的欄位：
-- date：消費日期，格式 YYYY-MM-DD（今天是 ${today}，截圖沒標年份時請用 ${today.slice(0, 4)} 年）
-- time：消費時間，24 小時制 HH:mm，看不到就填 ""
+- date：消費日期，格式 YYYY-MM-DD，一律照截圖上銀行顯示的日期填（今天是 ${today}，截圖沒標年份時請用 ${today.slice(0, 4)} 年）
+- time：消費時間，24 小時制 HH:mm，照截圖顯示填，看不到就填 ""
 - item：商家或品項名稱（保留原文）
 - amountUSD：美金金額（數字），截圖是美金才填，否則 null
 - amountTWD：台幣金額（數字），截圖是台幣才填，否則 null（截圖同時顯示美金和台幣時，兩個都填）
 - category：只能從這些選一個，請原樣輸出：${importCategories().join('、')}
-- method：只能從這些選一個，請原樣輸出：${state.methods.join('、')}；判斷不出來填 ""
+- method：只能從這些選一個，請原樣輸出：${state.methods.join('、')}；判斷不出來填 ""${richartMethod() ? `。若截圖是台新銀行（台新帳戶、台新 App、Richart）的交易，一律填 "${richartMethod()}"，不用再判斷` : ''}
 - note：其他補充（例如原始時間、卡號末四碼、小費、稅），沒有就填 ""
 
 規則：
 1. 退款、轉帳、餘額、點數、廣告等非消費項目不要列入。
-2. 若截圖時間看起來是台灣時間（例如台灣銀行或信用卡 App 的通知），請換算成 ${IMPORT_TZ} 當地時間再填 date 和 time，並在 note 寫「原截圖時間 台灣 yyyy-MM-dd HH:mm」。
+2. 截圖顯示的日期和時間（台灣時間）直接照填，不要做任何時區換算或判斷。
 3. 同一筆消費在多張截圖重複出現時只列一次。
 4. 金額只填數字，不要幣別符號和千分位逗號。
 5. 美金和台幣以外的幣別，金額欄位都填 null，並把原幣別與金額寫進 note（例如「原幣 JPY 1,200」）。
@@ -784,7 +787,9 @@ function normalizeImportItem(o) {
   const date = /^\d{4}-\d{2}-\d{2}$/.test(dateStr) ? dateStr : todayStr();
   const cats = importCategories();
   const category = matchOption(o.category, cats) || cats.find((c) => normOptionText(c).includes('其他')) || '';
-  const method = matchOption(o.method, state.methods);
+  let method = matchOption(o.method, state.methods);
+  // Claude 若只回「台新」或「Richart」而不是選項原文，也歸到 Richart 卡。
+  if (!method && /台新|richart/i.test(`${o.method || ''} ${o.note || ''}`)) method = richartMethod();
   const note = ['📸待確認', String(o.time || '').trim(), String(o.note || '').trim()].filter(Boolean).join(' ');
   return { date, category, method, item, amountUSD, amountTWD, note };
 }
