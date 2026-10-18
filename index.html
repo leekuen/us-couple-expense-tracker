@@ -25,15 +25,15 @@
       </div>
 
       <div class="card">
-        <h2>總計（不含還款）</h2>
+        <h2>總計（不含還款）<span class="count-chip" id="totalCount">0 筆</span></h2>
         <div class="summary-grid">
           <div>
-            <div class="total-label">總花費 USD</div>
+            <div class="total-label">美金 USD</div>
             <div class="total-value" id="totalUSD">$0</div>
           </div>
           <div>
-            <div class="total-label">筆數</div>
-            <div class="total-value" id="totalCount">0 筆</div>
+            <div class="total-label">台幣 TWD</div>
+            <div class="total-value" id="totalTWD">NT$0</div>
           </div>
         </div>
         <div class="person-summary" id="personSummary"></div>
@@ -45,6 +45,8 @@
         <div class="settle-sub" id="settleSub"></div>
         <button class="btn-primary" id="recordRepayBtn" style="display:none">💸 記錄還款</button>
       </div>
+
+      <button class="btn-secondary" id="importBtn">📸 從截圖匯入消費</button>
 
       <div id="expenseList"></div>
     </div>

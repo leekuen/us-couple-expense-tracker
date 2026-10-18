@@ -7,6 +7,9 @@
  *   3. 部署 → 新增部署作業 → 網頁應用程式（執行身分：我；誰可以存取：所有人）。
  *   4. 把 /exec 網址貼到記帳工具的「設定」頁，兩支手機都貼同一個網址。
  * 之後每次修改這份程式碼，都要「部署 → 管理部署作業 → 編輯 → 版本選新版本」才會生效。
+ *
+ * 從舊版升級（還沒有「金額（台幣）」欄的試算表）：貼上新程式碼後，再執行一次 setupSheet，
+ * 會自動在「金額（美金）」後面插入台幣欄，既有資料不會遺失；之後別忘了重新部署新版本。
  */
 var PEOPLE = ['力堃', '婍瑞'];
 var DEFAULT_CATEGORIES = ['🚗 交通', '🏨 住宿', '🍽 三餐', '☕️ 小食', '🎡 娛樂', '🛍️ 購物', '🎲 其他', '💸 還款'];
@@ -14,22 +17,31 @@ var DEFAULT_METHODS = ['現金', '刷卡', '電子支付'];
 
 var SHEET_NAME = '記帳';
 var HEADERS = [
-  '日期', '大項目', '項目名稱', '付款人', '支付方式', '金額（美金）', '付款人負擔比例（%）', '備註',
+  '日期', '大項目', '項目名稱', '付款人', '支付方式', '金額（美金）', '金額（台幣）', '付款人負擔比例（%）', '備註',
   '最後修改時間（同步用，勿刪）', '本機記錄ID（同步用，勿刪）'
 ];
-var COL = { DATE: 1, CATEGORY: 2, ITEM: 3, PAYER: 4, METHOD: 5, AMOUNT: 6, SHARE: 7, NOTE: 8, MODIFIED: 9, LOCAL_ID: 10 };
-var DATA_COLS = 8; // 前 8 欄是使用者看得到、會編輯的資料；第 9、10 欄是同步用
+var COL = {
+  DATE: 1, CATEGORY: 2, ITEM: 3, PAYER: 4, METHOD: 5, AMOUNT_USD: 6, AMOUNT_TWD: 7, SHARE: 8, NOTE: 9,
+  MODIFIED: 10, LOCAL_ID: 11
+};
+var DATA_COLS = 9; // 前 9 欄是使用者看得到、會編輯的資料；第 10、11 欄是同步用
+var OLD_SHARE_HEADER = '付款人負擔比例'; // 舊版第 7 欄的標題（舊版沒有台幣欄）
 
-/** 一次性：建立「記帳」分頁、標題列、下拉選單與格式。可重複執行，不會清掉既有資料。 */
+/** 一次性：建立「記帳」分頁、標題列、下拉選單與格式。可重複執行，不會清掉既有資料；也會升級舊版欄位。 */
 function setupSheet() {
   if (PEOPLE.length !== 2) throw new Error('PEOPLE 必須剛好兩個名字');
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var sheet = ss.getSheetByName(SHEET_NAME) || ss.insertSheet(SHEET_NAME);
+  if (isOldLayout_(sheet)) {
+    // 舊版：第 7 欄是「付款人負擔比例」。在美金欄後面插一欄給台幣，既有資料整體右移。
+    sheet.insertColumnAfter(COL.AMOUNT_USD);
+  }
   sheet.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]).setFontWeight('bold');
   sheet.setFrozenRows(1);
   var rows = sheet.getMaxRows() - 1;
   sheet.getRange(2, COL.DATE, rows, 1).setNumberFormat('yyyy-mm-dd');
-  sheet.getRange(2, COL.AMOUNT, rows, 1).setNumberFormat('#,##0.00');
+  sheet.getRange(2, COL.AMOUNT_USD, rows, 1).setNumberFormat('#,##0.00');
+  sheet.getRange(2, COL.AMOUNT_TWD, rows, 1).setNumberFormat('#,##0');
   sheet.getRange(2, COL.SHARE, rows, 1).setNumberFormat('0');
   setList_(sheet, COL.CATEGORY, DEFAULT_CATEGORIES);
   setList_(sheet, COL.PAYER, PEOPLE);
@@ -52,6 +64,8 @@ function doPost(e) {
     var ss = SpreadsheetApp.getActiveSpreadsheet();
     var sheet = ss.getSheetByName(SHEET_NAME);
     if (!sheet) throw new Error('找不到「' + SHEET_NAME + '」分頁，請先執行 setupSheet');
+    // 欄位還是舊版就寫入的話，台幣會被寫進「負擔比例」欄，所以直接拒絕。
+    if (isOldLayout_(sheet)) throw new Error('請先在 Apps Script 編輯器執行一次 setupSheet，升級試算表欄位');
     ensureBookkeepingColumns_(sheet);
     var tz = ss.getSpreadsheetTimeZone();
     var action = payload.action || 'create';
@@ -153,6 +167,11 @@ function doGet(e) {
 }
 
 /* ---------- helpers ---------- */
+function isOldLayout_(sheet) {
+  // 舊版（沒有台幣欄）的特徵：第 7 欄標題是「付款人負擔比例」。
+  return String(sheet.getRange(1, 7).getValue()).indexOf(OLD_SHARE_HEADER) !== -1;
+}
+
 function assertDataRow_(row) {
   // 第 1 列是標題列，絕對不能被 update/delete 動到。
   if (!row || row < 2) throw new Error('row 不正確');
@@ -165,7 +184,7 @@ function numOrBlank_(v) {
 function dataToRow_(d) {
   return [
     d.date || '', d.category || '', d.item || '', d.payer || '', d.method || '',
-    numOrBlank_(d.amountUSD), numOrBlank_(d.payerShare), d.note || ''
+    numOrBlank_(d.amountUSD), numOrBlank_(d.amountTWD), numOrBlank_(d.payerShare), d.note || ''
   ];
 }
 
@@ -175,7 +194,7 @@ function rowToData_(row, tz) {
     // 直接 JSON 序列化會變 UTC，GMT+8 的試算表日期會往前跳一天，所以用試算表自己的時區重新格式化。
     date: normalizeDateCell_(row[0], tz),
     category: row[1], item: row[2], payer: row[3], method: row[4],
-    amountUSD: row[5], payerShare: row[6], note: row[7]
+    amountUSD: row[5], amountTWD: row[6], payerShare: row[7], note: row[8]
   };
 }
 

@@ -29,14 +29,15 @@ function describeShare(share, payer, other) {
 }
 
 // net[p] > 0 代表別人欠 p 錢；兩人的 net 加起來永遠是 0。
-function computeBalances(rows, people) {
+// field 指定用哪個幣別的金額（'amountUSD' 或 'amountTWD'）；兩種幣別各算各的，互不換算。
+function computeBalances(rows, people, field = 'amountUSD') {
   const known = people.length === 2 ? people : [];
   const paid = {}, consumed = {}, net = {};
   people.forEach((p) => { paid[p] = 0; consumed[p] = 0; net[p] = 0; });
   let total = 0;
   let count = 0;
   for (const r of rows) {
-    const amt = Number(r.amountUSD);
+    const amt = Number(r[field]);
     if (!Number.isFinite(amt) || !amt) continue;
     const payer = r.payer;
     const other = known.find((p) => p !== payer);
@@ -214,8 +215,8 @@ async function getAllExpenses() {
   return rows.sort((a, b) => (b.date || '').localeCompare(a.date || '') || b.lastModified.localeCompare(a.lastModified));
 }
 
-async function addExpense(fields) {
-  const rec = {
+function buildExpenseRecord(fields) {
+  return {
     localId: uid(),
     date: fields.date,
     category: fields.category,
@@ -223,13 +224,24 @@ async function addExpense(fields) {
     payer: fields.payer,
     method: fields.method,
     amountUSD: fields.amountUSD,
+    amountTWD: fields.amountTWD,
     payerShare: fields.payerShare,
     note: fields.note || '',
     lastModified: nowISO(),
     sheetRow: null,
     syncStatus: 'pending-create',
   };
-  await idbPut(STORE_EXPENSES, rec);
+}
+
+async function addExpense(fields) {
+  await idbPut(STORE_EXPENSES, buildExpenseRecord(fields));
+  await renderAll();
+  runSync();
+}
+
+// 批次新增只重畫、同步一次（截圖匯入一次可能幾十筆）。
+async function addExpensesBatch(fieldsList) {
+  for (const fields of fieldsList) await idbPut(STORE_EXPENSES, buildExpenseRecord(fields));
   await renderAll();
   runSync();
 }
@@ -304,7 +316,8 @@ async function runSync() {
     await pushPendingToSheet();
   } catch (e) {
     console.error('sync failed', e);
-    showToast('同步失敗，稍後會自動重試');
+    // 「請先執行 setupSheet」這類需要你動手處理的錯誤要把原因顯示出來；一般網路問題才說稍後自動重試。
+    showToast(e.message && /請先/.test(e.message) ? '同步失敗：' + e.message : '同步失敗，稍後會自動重試');
   } finally {
     state.syncing = false;
     await updateSyncBadge();
@@ -359,7 +372,7 @@ async function pushPendingToSheet() {
   for (const rec of pending) {
     const data = {
       date: rec.date, category: rec.category, item: rec.item, payer: rec.payer, method: rec.method,
-      amountUSD: rec.amountUSD, payerShare: rec.payerShare, note: rec.note, lastModified: rec.lastModified,
+      amountUSD: rec.amountUSD, amountTWD: rec.amountTWD, payerShare: rec.payerShare, note: rec.note, lastModified: rec.lastModified,
     };
     const queuedAt = rec.lastModified;
 
@@ -398,23 +411,43 @@ async function renderAll() {
   await updateSyncBadge();
 }
 
-function renderSummary(rows) {
-  const b = computeBalances(rows, state.people);
-  $('#totalUSD').textContent = '$' + fmtMoney(b.total);
-  $('#totalCount').textContent = b.count + ' 筆';
-  $('#personSummary').innerHTML = state.people.map((p) => `
-    <div class="person-row">
-      <span class="person-name">${escapeHtml(p)}</span>
-      <span class="person-detail">已付 $${fmtMoney(b.paid[p])} ・ 實際負擔 $${fmtMoney(b.consumed[p])}</span>
-    </div>`).join('');
-  renderSettle(b);
+const hasAmount = (r, field) => { const n = Number(r[field]); return Number.isFinite(n) && n !== 0; };
+const usdText = (n) => '$' + fmtMoney(n);
+const twdText = (n) => 'NT$' + fmtMoney(n);
+
+// 列表／預覽用的金額顯示：有美金就美金在上、台幣在下；只有台幣就直接顯示台幣。
+function amountHtml(r) {
+  const usd = hasAmount(r, 'amountUSD') ? usdText(r.amountUSD) : '';
+  const twd = hasAmount(r, 'amountTWD') ? twdText(r.amountTWD) : '';
+  return `${usd || twd}${usd && twd ? `<small>${twd}</small>` : ''}`;
 }
 
-function renderSettle(b) {
+function renderSummary(rows) {
+  // 美金、台幣各自獨立計算（不換算匯率）。
+  const usd = computeBalances(rows, state.people, 'amountUSD');
+  const twd = computeBalances(rows, state.people, 'amountTWD');
+  const spent = rows.filter((r) => r.category !== SETTLE_CATEGORY && (hasAmount(r, 'amountUSD') || hasAmount(r, 'amountTWD')));
+  $('#totalUSD').textContent = usdText(usd.total);
+  $('#totalTWD').textContent = twdText(twd.total);
+  $('#totalCount').textContent = spent.length + ' 筆';
+  $('#personSummary').innerHTML = state.people.map((p) => {
+    const lines = [];
+    if (usd.count || !twd.count) lines.push(`已付 ${usdText(usd.paid[p])} ・ 實際負擔 ${usdText(usd.consumed[p])}`);
+    if (twd.count) lines.push(`已付 ${twdText(twd.paid[p])} ・ 實際負擔 ${twdText(twd.consumed[p])}`);
+    return `
+    <div class="person-row">
+      <span class="person-name">${escapeHtml(p)}</span>
+      <span class="person-detail">${lines.join('<br>')}</span>
+    </div>`;
+  }).join('');
+  renderSettle(usd, twd);
+}
+
+function renderSettle(usd, twd) {
   const textEl = $('#settleText');
   const subEl = $('#settleSub');
   const btn = $('#recordRepayBtn');
-  lastSettle = b.settle;
+  lastSettle = { usd: usd.settle, twd: twd.settle };
   if (state.people.length !== 2) {
     textEl.className = 'settle-text';
     textEl.textContent = '付款人需要剛好兩個人才能結算';
@@ -422,17 +455,25 @@ function renderSettle(b) {
     btn.style.display = 'none';
     return;
   }
-  if (!b.settle) {
+  // 有紀錄（或有還款）的幣別才列出一行；全部都沒有就顯示打平。
+  const lines = [];
+  if (usd.count || usd.settle) lines.push({ label: '美金', s: usd.settle, fmt: usdText });
+  if (twd.count || twd.settle) lines.push({ label: '台幣', s: twd.settle, fmt: twdText });
+  const lineText = (l) => (l.s ? `${l.s.from} 要給 ${l.s.to} ${l.fmt(l.s.amount)}` : '✅ 打平');
+  const anyOwed = lines.some((l) => l.s);
+  if (!anyOwed) {
     textEl.className = 'settle-text settled';
     textEl.textContent = '✅ 目前兩邊打平';
-    subEl.textContent = '';
-    btn.style.display = 'none';
-    return;
+  } else if (lines.length === 1) {
+    textEl.className = 'settle-text';
+    textEl.textContent = lineText(lines[0]);
+  } else {
+    // 兩種幣別都有紀錄：各列一行（其中一種可能已經打平）。
+    textEl.className = 'settle-text';
+    textEl.innerHTML = lines.map((l) => `<div>${l.label}｜${escapeHtml(lineText(l))}</div>`).join('');
   }
-  textEl.className = 'settle-text';
-  textEl.textContent = `${b.settle.from} 要給 ${b.settle.to} $${fmtMoney(b.settle.amount)}`;
-  subEl.textContent = '實際轉帳或給現金之後，按下面的按鈕記錄還款，結算就會歸零。';
-  btn.style.display = '';
+  subEl.textContent = anyOwed ? '實際轉帳或給現金之後，按下面的按鈕記錄還款，結算就會歸零。' : '';
+  btn.style.display = anyOwed ? '' : 'none';
 }
 
 function renderList(rows) {
@@ -469,7 +510,7 @@ function renderList(rows) {
               ${r.note ? '　' + escapeHtml(r.note) : ''}
             </div>
           </div>
-          <div class="exp-amount">${r.amountUSD ? '$' + fmtMoney(r.amountUSD) : ''}</div>
+          <div class="exp-amount">${amountHtml(r)}</div>
         </div>`;
     }
     html += '</div>';
@@ -606,9 +647,15 @@ async function openExpenseModal(localId, preset) {
           <label>項目名稱</label>
           <input type="text" id="f_item" value="${rec ? escapeHtml(rec.item) : escapeHtml(base.item || '')}" placeholder="例如：午餐">
         </div>
-        <div class="form-row">
-          <label>金額（美金）</label>
-          <input type="number" inputmode="decimal" id="f_usd" value="${base.amountUSD != null ? base.amountUSD : ''}">
+        <div class="form-row-split">
+          <div class="form-row">
+            <label>金額（美金）</label>
+            <input type="number" inputmode="decimal" id="f_usd" value="${base.amountUSD != null ? base.amountUSD : ''}">
+          </div>
+          <div class="form-row">
+            <label>金額（台幣）</label>
+            <input type="number" inputmode="decimal" id="f_twd" value="${base.amountTWD != null ? base.amountTWD : ''}">
+          </div>
         </div>
         <div class="form-row" id="splitRow">
           <label>怎麼分？</label>
@@ -652,8 +699,6 @@ async function openExpenseModal(localId, preset) {
     const payer = resolveChipValue('payer');
     const method = resolveChipValue('method');
     const isSettle = category === SETTLE_CATEGORY;
-    const usdRaw = $('#f_usd').value.trim();
-    const usd = usdRaw === '' ? null : Number(usdRaw);
     const payerShare = isSettle ? 0 : resolveSplit();
     const fields = {
       date: $('#f_date').value,
@@ -661,12 +706,14 @@ async function openExpenseModal(localId, preset) {
       payer,
       method,
       item: $('#f_item').value.trim(),
-      amountUSD: usd != null && Number.isFinite(usd) ? usd : null,
+      amountUSD: toAmount($('#f_usd').value),
+      amountTWD: toAmount($('#f_twd').value),
       payerShare,
       note: $('#f_note').value.trim(),
     };
-    if (!fields.date || !fields.item || !category || !payer || !method || fields.amountUSD == null || payerShare == null) {
-      showToast('請填完日期、分類、付款人、付款方式、項目、金額與分帳方式');
+    // 美金、台幣至少要填一個；兩個都填時各自獨立計算，不換算匯率。
+    if (!fields.date || !fields.item || !category || !payer || !method || (fields.amountUSD == null && fields.amountTWD == null) || payerShare == null) {
+      showToast('請填完日期、分類、付款人、付款方式、項目、金額（美金或台幣至少一個）與分帳方式');
       return;
     }
     // 已存在的值會直接略過；全新的值會馬上加進 chip 清單，並排進佇列等下次同步寫進試算表下拉選單。
@@ -678,6 +725,220 @@ async function openExpenseModal(localId, preset) {
   });
 }
 function closeModal() { $('#modalRoot').innerHTML = ''; }
+
+/* ---------- 截圖匯入（辨識在 claude.ai 完成，不需要 API key） ---------- */
+// 截圖時間若是台灣時間，請 Claude 換算成這個時區再填日期與時間。
+const IMPORT_TZ = 'America/New_York';
+
+function normOptionText(s) { return String(s || '').replace(/[^\p{L}\p{N}]/gu, '').toLowerCase(); }
+
+// Claude 回傳的分類可能少了 emoji（或 emoji 的變體選擇符不同），所以只比對文字與數字。
+function matchOption(value, list) {
+  const v = String(value || '').trim();
+  if (!v) return '';
+  const exact = list.find((o) => o === v);
+  if (exact) return exact;
+  const n = normOptionText(v);
+  return n ? (list.find((o) => normOptionText(o) === n) || '') : '';
+}
+
+function toAmount(v) {
+  if (v == null || v === '') return null;
+  const n = typeof v === 'number' ? v : parseFloat(String(v).replace(/[^\d.\-]/g, ''));
+  return Number.isFinite(n) ? n : null;
+}
+
+// 「💸 還款」是結算專用分類，不是消費，不要讓 Claude 選到它。
+function importCategories() { return state.categories.filter((c) => c !== SETTLE_CATEGORY); }
+
+function buildImportPrompt() {
+  const today = todayStr();
+  return `我會附上一或多張消費截圖（信用卡通知、行動支付、收據、訂單截圖等）。請辨識每一筆「實際消費」，只輸出一個 JSON 陣列，不要輸出任何其他文字或說明。
+
+每筆物件的欄位：
+- date：消費日期，格式 YYYY-MM-DD（今天是 ${today}，截圖沒標年份時請用 ${today.slice(0, 4)} 年）
+- time：消費時間，24 小時制 HH:mm，看不到就填 ""
+- item：商家或品項名稱（保留原文）
+- amountUSD：美金金額（數字），截圖是美金才填，否則 null
+- amountTWD：台幣金額（數字），截圖是台幣才填，否則 null（截圖同時顯示美金和台幣時，兩個都填）
+- category：只能從這些選一個，請原樣輸出：${importCategories().join('、')}
+- method：只能從這些選一個，請原樣輸出：${state.methods.join('、')}；判斷不出來填 ""
+- note：其他補充（例如原始時間、卡號末四碼、小費、稅），沒有就填 ""
+
+規則：
+1. 退款、轉帳、餘額、點數、廣告等非消費項目不要列入。
+2. 若截圖時間看起來是台灣時間（例如台灣銀行或信用卡 App 的通知），請換算成 ${IMPORT_TZ} 當地時間再填 date 和 time，並在 note 寫「原截圖時間 台灣 yyyy-MM-dd HH:mm」。
+3. 同一筆消費在多張截圖重複出現時只列一次。
+4. 金額只填數字，不要幣別符號和千分位逗號。
+5. 美金和台幣以外的幣別，金額欄位都填 null，並把原幣別與金額寫進 note（例如「原幣 JPY 1,200」）。
+6. 不確定的欄位寧可填 "" 或 null，不要猜。`;
+}
+
+function normalizeImportItem(o) {
+  if (!o || typeof o !== 'object') return null;
+  const amountUSD = toAmount(o.amountUSD);
+  const amountTWD = toAmount(o.amountTWD);
+  const item = String(o.item || '').trim();
+  if (!item && amountUSD == null && amountTWD == null) return null;
+  const dateStr = String(o.date || '').trim();
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(dateStr) ? dateStr : todayStr();
+  const cats = importCategories();
+  const category = matchOption(o.category, cats) || cats.find((c) => normOptionText(c).includes('其他')) || '';
+  const method = matchOption(o.method, state.methods);
+  const note = ['📸待確認', String(o.time || '').trim(), String(o.note || '').trim()].filter(Boolean).join(' ');
+  return { date, category, method, item, amountUSD, amountTWD, note };
+}
+
+function parseImportText(text) {
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const body = fenced ? fenced[1] : text;
+  const start = body.indexOf('[');
+  const end = body.lastIndexOf(']');
+  if (start === -1 || end <= start) throw new Error('找不到 JSON 陣列，請確認有把 Claude 的整段回覆貼進來');
+  let arr;
+  try { arr = JSON.parse(body.slice(start, end + 1)); } catch (e) { throw new Error('JSON 格式有誤，請請 Claude 重新輸出一次'); }
+  if (!Array.isArray(arr)) throw new Error('回覆不是陣列格式');
+  return arr.map(normalizeImportItem).filter(Boolean);
+}
+
+// 同一天、美金或台幣金額相同，而且不是已排隊刪除或還款的紀錄 → 提醒可能重複。
+function looksDuplicate(it, existing) {
+  return existing.some((e) =>
+    e.syncStatus !== 'pending-delete' && e.category !== SETTLE_CATEGORY && e.date === it.date && (
+      (it.amountUSD != null && Number(e.amountUSD) === it.amountUSD) ||
+      (it.amountTWD != null && Number(e.amountTWD) === it.amountTWD)));
+}
+
+let importDraft = '';
+
+function openImportModal() {
+  $('#modalRoot').innerHTML = `
+    <div class="modal-backdrop" id="modalBackdrop">
+      <div class="modal-sheet">
+        <h3>📸 從截圖匯入</h3>
+        <ol class="import-steps">
+          <li>按下方按鈕複製提示詞。</li>
+          <li>打開 claude.ai，貼上提示詞並附上消費截圖（可一次多張），送出。</li>
+          <li>把 Claude 回覆的內容整段複製，貼到下面。</li>
+        </ol>
+        <button class="btn-secondary" id="copyPromptBtn">📋 複製提示詞</button>
+        <a class="btn-secondary import-link" href="https://claude.ai/new" target="_blank" rel="noopener">🔗 開啟 claude.ai</a>
+        <details class="howto">
+          <summary>複製沒反應？手動複製提示詞</summary>
+          <textarea id="promptFallback" readonly rows="8"></textarea>
+        </details>
+        <div class="form-row">
+          <label>Claude 的回覆</label>
+          <textarea id="importPaste" rows="6" placeholder="貼上 Claude 回覆的 JSON…"></textarea>
+        </div>
+        <div class="modal-actions">
+          <button class="cancel-btn" id="cancelBtn">取消</button>
+          <button class="save-btn" id="parseBtn">解析</button>
+        </div>
+      </div>
+    </div>`;
+  $('#promptFallback').value = buildImportPrompt();
+  $('#importPaste').value = importDraft;
+  $('#modalBackdrop').addEventListener('click', (e) => { if (e.target.id === 'modalBackdrop') closeModal(); });
+  $('#cancelBtn').addEventListener('click', closeModal);
+  $('#copyPromptBtn').addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(buildImportPrompt());
+      showToast('已複製提示詞');
+    } catch (e) {
+      showToast('無法自動複製，請展開下方手動複製');
+    }
+  });
+  $('#parseBtn').addEventListener('click', async () => {
+    importDraft = $('#importPaste').value;
+    let items;
+    try { items = parseImportText(importDraft); } catch (e) { showToast(e.message); return; }
+    if (!items.length) { showToast('沒有辨識到任何消費紀錄'); return; }
+    await showImportPreview(items);
+  });
+}
+
+async function showImportPreview(items) {
+  const existing = await getAllExpenses();
+  // 可能重複、或美金台幣都沒有金額（原幣在備註）的預設不勾選。
+  const rows = items.map((it) => {
+    const dup = looksDuplicate(it, existing);
+    const noAmount = it.amountUSD == null && it.amountTWD == null;
+    return { it, dup, noAmount, checked: !dup && !noAmount };
+  });
+  const people = state.people.slice();
+  const defaultPayer = people.includes(state.me) ? state.me : people[0];
+
+  $('#modalRoot').innerHTML = `
+    <div class="modal-backdrop" id="modalBackdrop">
+      <div class="modal-sheet">
+        <h3>辨識到 ${rows.length} 筆</h3>
+        <p class="hint">勾選要匯入的項目。「可能重複」代表同一天已有相同金額的紀錄；「沒有金額」代表截圖不是美金也不是台幣（原幣在備註）。這兩種預設不勾選。匯入後可逐筆點開修改細節。</p>
+        <div id="importList">
+          ${rows.map((r, i) => `
+            <label class="import-row ${r.dup || r.noAmount ? 'dup' : ''}">
+              <input type="checkbox" data-i="${i}" ${r.checked ? 'checked' : ''}>
+              <div class="import-main">
+                <div class="exp-title">${escapeHtml(r.it.item || '(未命名)')}</div>
+                <div class="exp-meta">${escapeHtml(r.it.date)}　${escapeHtml(r.it.category)}　${escapeHtml(r.it.method || '付款方式待選')}${r.dup ? '　⚠️可能重複' : ''}${r.noAmount ? '　⚠️沒有金額' : ''}</div>
+                <div class="exp-meta">${escapeHtml(r.it.note)}</div>
+              </div>
+              <div class="exp-amount">${r.noAmount ? '—' : amountHtml(r.it)}</div>
+            </label>`).join('')}
+        </div>
+        <div class="form-row">
+          <label>這一批是誰付的</label>
+          ${chipGroupHtml('impPayer', people, defaultPayer, { allowCustom: false })}
+        </div>
+        <div class="form-row">
+          <label>怎麼分</label>
+          <div id="impSplitWrap"></div>
+        </div>
+        <div class="modal-actions">
+          <button class="cancel-btn" id="backBtn">返回</button>
+          <button class="save-btn" id="importBtnConfirm"></button>
+        </div>
+      </div>
+    </div>`;
+
+  let impShare = 50;
+  const drawImpSplit = () => {
+    const payer = resolveChipValue('impPayer');
+    const other = otherPerson(payer);
+    const presets = [[50, '平分'], [100, `${payer}自己用`], [0, `${other || '對方'}全額`]];
+    $('#impSplitWrap').innerHTML = `<div class="chip-group" id="impSplitChips">${presets.map(([v, label]) =>
+      `<button type="button" class="chip ${v === impShare ? 'selected' : ''}" data-value="${v}">${escapeHtml(label)}</button>`).join('')}</div>`;
+    $('#impSplitChips').addEventListener('click', (e) => {
+      const btn = e.target.closest('.chip');
+      if (!btn) return;
+      impShare = Number(btn.dataset.value);
+      drawImpSplit();
+    });
+  };
+  wireChipGroup('impPayer', drawImpSplit);
+  drawImpSplit();
+
+  const selected = () => [...document.querySelectorAll('#importList input:checked')].map((el) => rows[Number(el.dataset.i)].it);
+  const refreshCount = () => {
+    const n = selected().length;
+    const btn = $('#importBtnConfirm');
+    btn.textContent = `匯入 ${n} 筆`;
+    btn.disabled = n === 0;
+  };
+  refreshCount();
+  $('#importList').addEventListener('change', refreshCount);
+  $('#modalBackdrop').addEventListener('click', (e) => { if (e.target.id === 'modalBackdrop') closeModal(); });
+  $('#backBtn').addEventListener('click', openImportModal);
+  $('#importBtnConfirm').addEventListener('click', async () => {
+    const chosen = selected();
+    if (!chosen.length) return;
+    const payer = resolveChipValue('impPayer');
+    await addExpensesBatch(chosen.map((it) => ({ ...it, payer, payerShare: impShare })));
+    importDraft = '';
+    closeModal();
+    showToast(`已匯入 ${chosen.length} 筆，請逐筆確認細節`);
+  });
+}
 
 /* ---------- settings ---------- */
 async function loadAppsScriptCode() {
@@ -724,8 +985,15 @@ function wireSettings() {
     });
   });
   $('#recordRepayBtn').addEventListener('click', () => {
-    if (!lastSettle) return;
-    openExpenseModal(null, { category: SETTLE_CATEGORY, payer: lastSettle.from, item: '還款', amountUSD: lastSettle.amount });
+    const first = lastSettle && (lastSettle.usd || lastSettle.twd);
+    if (!first) return;
+    // 兩種幣別的欠款方向理論上一致；若不一致，只預填跟第一筆同一個還款人的那個幣別。
+    const payer = first.from;
+    openExpenseModal(null, {
+      category: SETTLE_CATEGORY, payer, item: '還款',
+      amountUSD: lastSettle.usd && lastSettle.usd.from === payer ? lastSettle.usd.amount : null,
+      amountTWD: lastSettle.twd && lastSettle.twd.from === payer ? lastSettle.twd.amount : null,
+    });
   });
 }
 
@@ -747,6 +1015,7 @@ async function init() {
   wireTabs();
   loadAppsScriptCode();
   $('#addFab').addEventListener('click', () => openExpenseModal(null));
+  $('#importBtn').addEventListener('click', openImportModal);
   $('#syncBadge').addEventListener('click', () => {
     if (state.syncUrl) runSync();
     else switchTab('tab-settings');
