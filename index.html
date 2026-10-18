@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>美國共同記帳</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<meta name="theme-color" content="#3f5fa8">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="topbar">
+    <h1>👫 美國共同記帳</h1>
+    <button id="syncBadge" class="sync-badge">初始化中…</button>
+  </div>
+  <div class="offline-banner" id="offlineBanner">📴 目前離線,記帳會先存在手機上,恢復連線後自動同步</div>
+
+  <div id="app">
+    <div class="tab-panel active" id="tab-record">
+      <div class="card who-card" id="whoCard" style="display:none">
+        <h2>👋 這支手機是誰？</h2>
+        <p class="hint">選一次就好，之後新增記帳會預設由你付款。</p>
+        <div class="chip-group" id="whoChips"></div>
+      </div>
+
+      <div class="card">
+        <h2>總計（不含還款）</h2>
+        <div class="summary-grid">
+          <div>
+            <div class="total-label">總花費 USD</div>
+            <div class="total-value" id="totalUSD">$0</div>
+          </div>
+          <div>
+            <div class="total-label">筆數</div>
+            <div class="total-value" id="totalCount">0 筆</div>
+          </div>
+        </div>
+        <div class="person-summary" id="personSummary"></div>
+      </div>
+
+      <div class="card settle-card" id="settleCard">
+        <h2>💸 結算</h2>
+        <div class="settle-text" id="settleText"></div>
+        <div class="settle-sub" id="settleSub"></div>
+        <button class="btn-primary" id="recordRepayBtn" style="display:none">💸 記錄還款</button>
+      </div>
+
+      <div id="expenseList"></div>
+    </div>
+
+    <div class="tab-panel" id="tab-settings">
+      <div class="card">
+        <h2>👋 這支手機是誰？</h2>
+        <div class="chip-group" id="whoChipsSettings"></div>
+        <p class="hint">只存在這支手機，不會同步。新增記帳時會預設由這個人付款。</p>
+      </div>
+
+      <div class="card" id="settingsCard">
+        <h2>⚙️ 雲端同步設定</h2>
+        <p class="hint">你和另一半的手機都貼<b>同一個</b>網址，記帳就會互相同步到同一份 Google 試算表。離線時新增/編輯/刪除都會先存在手機上，恢復連線後自動補同步。</p>
+        <div class="form-row">
+          <label>Apps Script Web App 網址</label>
+          <input id="syncUrlInput" type="url" placeholder="https://script.google.com/macros/s/.../exec">
+        </div>
+        <button class="btn-primary" id="saveSyncUrlBtn">儲存並立即同步</button>
+        <button class="btn-secondary" id="manualSyncBtn">🔄 手動同步</button>
+        <div class="hint" id="syncResult"></div>
+
+        <details class="howto">
+          <summary>還沒設定？點我看一次性設定步驟</summary>
+          <ol>
+            <li>新增一份空白的 Google 試算表（名字隨意，例如「美國共同記帳」）。</li>
+            <li>上方選單「擴充功能」→「Apps Script」，把編輯器裡原本的程式碼全部刪掉，貼上下面這段：</li>
+          </ol>
+          <div class="code-block-wrap">
+            <button class="btn-secondary copy-btn" id="copyAppsScriptBtn">📋 複製程式碼</button>
+            <pre id="appsScriptCode" class="code-block">載入中…</pre>
+          </div>
+          <ol start="3">
+            <li>把最上面的 <code>PEOPLE</code> 改成你們兩個人的名字（剛好兩個），按左上角磁碟片圖示存檔。</li>
+            <li>上方函式選單選「<code>setupSheet</code>」→ 按「執行」→ 依指示授權（只需要做一次，會自動建好「記帳」分頁、標題列和下拉選單）。</li>
+            <li>右上角「部署」→「新增部署作業」→ 齒輪圖示選「網頁應用程式」。</li>
+            <li>執行身分選「我」，這樣「誰可以存取」才會出現「所有人」選項，務必選「所有人」。</li>
+            <li>按「部署」，授權後複製 Web App 網址（結尾是 <code>/exec</code>），貼到上方輸入框存起來。另一半的手機也貼同一個網址。</li>
+            <li>之後每次改這段程式碼，記得「管理部署作業」→ 編輯 → 選新版本，否則舊程式碼還在跑。</li>
+          </ol>
+          <p class="hint">⚠️ 不要用 Apps Script 編輯器上方的「執行」按鈕測試 <code>doPost</code>，那樣不會送出網路請求。「💸 還款」是結算用的特殊分類，請不要在試算表改名。</p>
+        </details>
+      </div>
+
+      <div class="card">
+        <h2>📲 加到手機主畫面</h2>
+        <div class="install-steps">
+          <p><b>iPhone（Safari）：</b>打開這個網址 → 點下方分享圖示 <code>⬆️</code> → 選「加入主畫面」→ 完成後桌面會有一個圖示，點開就像 App 一樣全螢幕、沒有網址列。</p>
+          <p><b>Android（Chrome）：</b>打開這個網址 → 右上角選單 <code>⋮</code> → 選「新增至主畫面」或「安裝應用程式」。</p>
+        </div>
+      </div>
+
+      <div class="card danger-card">
+        <h2>⚠️ 危險操作</h2>
+        <div class="checkbox-row">
+          <input type="checkbox" id="clearLocalCheckbox">
+          <label for="clearLocalCheckbox">我了解，清除本機資料前請先確認已同步</label>
+        </div>
+        <button class="btn-danger" id="clearLocalBtn">清除本機所有記帳資料</button>
+      </div>
+    </div>
+  </div>
+
+  <button class="add-fab" id="addFab">＋</button>
+
+  <div class="bottom-nav">
+    <button class="nav-btn active" data-tab="tab-record"><span>📝</span><span>記帳</span></button>
+    <button class="nav-btn" data-tab="tab-settings"><span>⚙️</span><span>設定</span></button>
+  </div>
+
+  <div id="modalRoot"></div>
+  <div id="toast"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
