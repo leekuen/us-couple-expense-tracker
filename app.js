@@ -7,7 +7,7 @@ const STORE_META = 'meta';
 
 // 「還款」是結算用的特殊分類：不算花費，只用來沖銷兩人之間的欠款。
 const SETTLE_CATEGORY = '💸 還款';
-const DEFAULT_PEOPLE = ['力堃', '女友'];
+const DEFAULT_PEOPLE = ['力堃', '婍瑞'];
 const DEFAULT_CATEGORIES = ['🚗 交通', '🏨 住宿', '🍽 三餐', '☕️ 小食', '🎡 娛樂', '🛍️ 購物', '🎲 其他', SETTLE_CATEGORY];
 const DEFAULT_METHODS = ['現金', '刷卡', '電子支付'];
 
@@ -523,7 +523,7 @@ function resolveChipValue(name) {
   return group.dataset.value;
 }
 
-// 分帳方式 chip：標籤會跟著目前選的付款人變（「力堃自己用」「女友全額」）。
+// 分帳方式 chip：標籤會跟著目前選的付款人變（「力堃自己用」「婍瑞全額」）。
 function drawSplit(share) {
   const payer = resolveChipValue('payer');
   const other = otherPerson(payer);
