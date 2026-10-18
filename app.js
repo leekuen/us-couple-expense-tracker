@@ -77,6 +77,10 @@ let state = {
   me: '', // 這支手機是誰（只存在本機，不同步）
   pendingOptions: [], // [{field:'category'|'method', value}] 從「✏️ 自訂」chip 輸入、等著同步到試算表下拉選單
   syncing: false,
+  syncErrors: {}, // 每個項目最近一次失敗原因，key 是 localId 或 'opt:欄位:值'（只存在記憶體，給「同步狀態」面板看）
+  lastSyncError: null, // 最近一次整輪同步失敗 {message, at}
+  lastSyncOk: '',
+  dupIgnored: [], // 使用者標記「不是重複」的群組 id
 };
 let lastSettle = null;
 
@@ -159,6 +163,8 @@ async function loadMeta() {
     if (r.key === 'people' && r.value && r.value.length) state.people = r.value;
     if (r.key === 'me' && typeof r.value === 'string') state.me = r.value;
     if (r.key === 'pendingOptions' && Array.isArray(r.value)) state.pendingOptions = r.value;
+    if (r.key === 'lastSyncOk') state.lastSyncOk = r.value;
+    if (r.key === 'dupIgnored' && Array.isArray(r.value)) state.dupIgnored = r.value;
   }
 }
 function saveMeta(key, value) {
@@ -197,16 +203,33 @@ async function registerCustomOption(field, value) {
 async function pushPendingOptions() {
   if (!state.pendingOptions.length) return;
   const remaining = [];
-  for (const opt of state.pendingOptions) {
+  const skippedOptions = [];
+  const queue = state.pendingOptions;
+  for (let i = 0; i < queue.length; i++) {
+    const opt = queue[i];
+    const key = 'opt:' + opt.field + ':' + opt.value;
     try {
       await callSync('addOption', opt);
+      delete state.syncErrors[key];
     } catch (e) {
+      // 重試也不可能成功的錯誤（下拉選單不是單純清單、找不到欄位）：直接移出佇列，
+      // 不要讓「待同步」永遠掛著。這個值在本機和試算表儲存格裡本來就能用。
+      if (e.server && /不是簡單清單型態|找不到欄位|缺少要新增的值|不支援的欄位/.test(e.message)) {
+        delete state.syncErrors[key];
+        skippedOptions.push(opt.value);
+        continue;
+      }
       console.error('addOption sync failed, will retry later', e);
+      state.syncErrors[key] = { message: e.message, at: nowISO() };
       remaining.push(opt);
+      if (e.network) { remaining.push(...queue.slice(i + 1)); break; }
     }
   }
   state.pendingOptions = remaining;
   await saveMeta('pendingOptions', remaining);
+  if (skippedOptions.length) {
+    showToast('這些選項無法自動加進試算表的下拉選單（不影響記帳）：' + skippedOptions.join('、'));
+  }
 }
 
 /* ---------- expense CRUD (local-first) ---------- */
@@ -274,14 +297,29 @@ async function deleteExpense(localId) {
 
 /* ---------- sync engine ---------- */
 // Content-Type text/plain 可以避開 CORS preflight（Apps Script 不回應 OPTIONS）。
+// err.network＝這次請求根本沒拿到可用的回應（斷網、網址錯、回傳登入頁而不是 JSON），
+// 本輪後面的項目也一定會失敗；err.server＝後端有回應，只是拒絕了這一個請求。
 async function callSync(action, payload) {
-  const resp = await fetch(state.syncUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-    body: JSON.stringify({ action, ...payload }),
-  });
-  const json = await resp.json();
-  if (json.status !== 'ok') throw new Error(json.message || 'sync failed');
+  let json;
+  try {
+    const resp = await fetch(state.syncUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ action, ...payload }),
+    });
+    json = await resp.json();
+  } catch (e) {
+    const err = new Error(e instanceof SyntaxError
+      ? '伺服器回應不是 JSON，可能是 Apps Script 網址或「誰可以存取」設定有誤'
+      : '連線失敗（網路中斷或網址不正確）：' + e.message);
+    err.network = true;
+    throw err;
+  }
+  if (json.status !== 'ok') {
+    const err = new Error(json.message || '伺服器回報失敗');
+    err.server = true;
+    throw err;
+  }
   return json;
 }
 
@@ -314,10 +352,13 @@ async function runSync() {
     await pullFromSheet();
     await pushPendingOptions();
     await pushPendingToSheet();
+    state.lastSyncError = null;
+    state.lastSyncOk = nowISO();
+    await saveMeta('lastSyncOk', state.lastSyncOk);
   } catch (e) {
     console.error('sync failed', e);
-    // 「請先執行 setupSheet」這類需要你動手處理的錯誤要把原因顯示出來；一般網路問題才說稍後自動重試。
-    showToast(e.message && /請先/.test(e.message) ? '同步失敗：' + e.message : '同步失敗，稍後會自動重試');
+    state.lastSyncError = { message: e.message, at: nowISO() };
+    showToast('同步失敗：' + e.message);
   } finally {
     state.syncing = false;
     await updateSyncBadge();
@@ -326,8 +367,31 @@ async function runSync() {
   }
 }
 
+// 舊版後端會把日期儲存格序列化成 UTC 字串（"2026-08-31T16:00:00.000Z"＝GMT+8 的 9/1），
+// 這裡轉回台北的日曆日期；也接受手打的 "2026/9/1"。後端已修正時這個函式只是原樣回傳。
+function normalizeRemoteDate(v) {
+  const s = String(v == null ? '' : v).trim();
+  if (/^\d{4}-\d{2}-\d{2}T/.test(s)) {
+    const d = new Date(s);
+    if (!isNaN(d)) {
+      return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Taipei', year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
+    }
+  }
+  const m = s.match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})$/);
+  if (m) return `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`;
+  return s;
+}
+
 async function pullFromSheet() {
+  const fullPull = !state.lastPullTime;
   const res = await callSync('pull', { since: state.lastPullTime || '' });
+  // 單人記帳（STUF）版的後端不會回傳 people。貼錯程式碼時，如果繼續 push，
+  // 資料會被寫進錯誤的欄位，所以在這裡直接停下來。
+  if (!Array.isArray(res.people)) {
+    const err = new Error('後端程式碼不是雙人記帳版（可能貼成單人記帳的了）。請用這個工具設定頁的「複製程式碼」重新貼上並部署新版本');
+    err.server = true;
+    throw err;
+  }
   if (res.categories && res.categories.length) { state.categories = res.categories; await saveMeta('categories', res.categories); }
   if (res.methods && res.methods.length) { state.methods = res.methods; await saveMeta('methods', res.methods); }
   if (res.people && res.people.length) {
@@ -342,6 +406,7 @@ async function pullFromSheet() {
 
   for (const remote of res.rows) {
     const local = bySheetRow.get(remote.row);
+    const data = { ...remote.data, date: normalizeRemoteDate(remote.data && remote.data.date) };
     if (local) {
       const localPending = local.syncStatus && local.syncStatus.startsWith('pending');
       const remoteWins = !localPending || remote.lastModified > local.lastModified;
@@ -349,17 +414,26 @@ async function pullFromSheet() {
       if (remote.deleted) {
         await idbDelete(STORE_EXPENSES, local.localId);
       } else {
-        Object.assign(local, remote.data, { lastModified: remote.lastModified, syncStatus: 'synced', sheetRow: remote.row });
+        Object.assign(local, data, { lastModified: remote.lastModified, syncStatus: 'synced', sheetRow: remote.row });
         await idbPut(STORE_EXPENSES, local);
       }
     } else if (!remote.deleted) {
       await idbPut(STORE_EXPENSES, {
         localId: uid(),
-        ...remote.data,
+        ...data,
         lastModified: remote.lastModified,
         sheetRow: remote.row,
         syncStatus: 'synced',
       });
+    }
+  }
+  if (fullPull) {
+    // 完整 pull 會回傳試算表上所有存在的列，所以已同步、但這次沒回來的本機紀錄，
+    // 代表那一列已經不存在了（例如列被刪掉、下面的列往上移）。移除它，手機才會跟試算表一致；
+    // 還有未同步變更的紀錄不動。
+    const seen = new Set(res.rows.filter((r) => !r.deleted).map((r) => r.row));
+    for (const r of await idbGetAll(STORE_EXPENSES)) {
+      if (r.sheetRow && r.syncStatus === 'synced' && !seen.has(r.sheetRow)) await idbDelete(STORE_EXPENSES, r.localId);
     }
   }
   state.lastPullTime = res.serverTime;
@@ -370,45 +444,261 @@ async function pushPendingToSheet() {
   const rows = await idbGetAll(STORE_EXPENSES);
   const pending = rows.filter((r) => r.syncStatus && r.syncStatus.startsWith('pending')).sort((a, b) => a.lastModified.localeCompare(b.lastModified));
   for (const rec of pending) {
-    const data = {
-      date: rec.date, category: rec.category, item: rec.item, payer: rec.payer, method: rec.method,
-      amountUSD: rec.amountUSD, amountTWD: rec.amountTWD, payerShare: rec.payerShare, note: rec.note, lastModified: rec.lastModified,
-    };
-    const queuedAt = rec.lastModified;
-
-    if (rec.syncStatus === 'pending-create') {
-      // localId 讓後端能認得重試的請求（例如手機剛好在伺服器建好列、回應還沒送達時斷線），
-      // 回傳既有那列而不是再 append 一列重複的。
-      const res = await callSync('create', { data, localId: rec.localId });
-      // 重新讀一次而不是把 await 前的舊快照寫回去：請求飛行期間使用者可能又編輯或刪除了這筆，
-      // 盲目覆蓋會丟掉編輯，或讓剛刪掉的紀錄復活。
-      const current = (await idbGetAll(STORE_EXPENSES)).find((r) => r.localId === rec.localId);
-      if (!current) continue; // 期間在本機被刪了；試算表上會留下一列孤兒，屬於可接受的罕見情況
-      current.sheetRow = res.row;
-      current.syncStatus = current.lastModified === queuedAt ? 'synced' : 'pending-update';
-      await idbPut(STORE_EXPENSES, current);
-    } else if (rec.syncStatus === 'pending-update') {
-      await callSync('update', { row: rec.sheetRow, data, localId: rec.localId });
-      const current = (await idbGetAll(STORE_EXPENSES)).find((r) => r.localId === rec.localId);
-      if (!current) continue;
-      if (current.lastModified === queuedAt) current.syncStatus = 'synced';
-      await idbPut(STORE_EXPENSES, current);
-    } else if (rec.syncStatus === 'pending-delete') {
-      await callSync('delete', { row: rec.sheetRow, data: { lastModified: rec.lastModified } });
-      const current = (await idbGetAll(STORE_EXPENSES)).find((r) => r.localId === rec.localId);
-      // 只有在送出刪除之後沒被改過才從本機移除（例如使用者沒有中途又打開編輯）。
-      if (current && current.lastModified === queuedAt) await idbDelete(STORE_EXPENSES, rec.localId);
+    try {
+      await pushOneRecord(rec);
+      delete state.syncErrors[rec.localId];
+    } catch (e) {
+      console.error('push failed for', rec.localId, e);
+      state.syncErrors[rec.localId] = { message: e.message, at: nowISO() };
+      // 後端只拒絕這一筆時，不能擋住排在後面的紀錄；網路層級的失敗代表後面的也一定會失敗，才中止整輪。
+      if (e.network) throw e;
     }
   }
+}
+
+async function pushOneRecord(rec) {
+  const data = {
+    date: rec.date, category: rec.category, item: rec.item, payer: rec.payer, method: rec.method,
+    amountUSD: rec.amountUSD, amountTWD: rec.amountTWD, payerShare: rec.payerShare, note: rec.note, lastModified: rec.lastModified,
+  };
+  const queuedAt = rec.lastModified;
+
+  if (rec.syncStatus === 'pending-create') {
+    // localId 讓後端能認得重試的請求（例如手機剛好在伺服器建好列、回應還沒送達時斷線），
+    // 回傳既有那列而不是再 append 一列重複的。
+    const res = await callSync('create', { data, localId: rec.localId });
+    // 重新讀一次而不是把 await 前的舊快照寫回去：請求飛行期間使用者可能又編輯或刪除了這筆，
+    // 盲目覆蓋會丟掉編輯，或讓剛刪掉的紀錄復活。
+    const current = (await idbGetAll(STORE_EXPENSES)).find((r) => r.localId === rec.localId);
+    if (!current) return; // 期間在本機被刪了；試算表上會留下一列孤兒，屬於可接受的罕見情況
+    current.sheetRow = res.row;
+    current.syncStatus = current.lastModified === queuedAt ? 'synced' : 'pending-update';
+    await idbPut(STORE_EXPENSES, current);
+  } else if (rec.syncStatus === 'pending-update') {
+    await callSync('update', { row: rec.sheetRow, data, localId: rec.localId });
+    const current = (await idbGetAll(STORE_EXPENSES)).find((r) => r.localId === rec.localId);
+    if (!current) return;
+    if (current.lastModified === queuedAt) current.syncStatus = 'synced';
+    await idbPut(STORE_EXPENSES, current);
+  } else if (rec.syncStatus === 'pending-delete') {
+    await callSync('delete', { row: rec.sheetRow, data: { lastModified: rec.lastModified } });
+    const current = (await idbGetAll(STORE_EXPENSES)).find((r) => r.localId === rec.localId);
+    // 只有在送出刪除之後沒被改過才從本機移除（例如使用者沒有中途又打開編輯）。
+    if (current && current.lastModified === queuedAt) await idbDelete(STORE_EXPENSES, rec.localId);
+  }
+}
+
+/* ---------- 找出可能重複 ---------- */
+// 同一天、金額（美金＋台幣）相同是基本條件；再加上付款人與項目名稱也相同＝「很可能重複」，
+// 其餘（例如項目不同、或付款人不同）列為「金額相同，請確認」讓使用者自己判斷。
+function normItemKey(s) { return String(s || '').toLowerCase().replace(/[^\p{L}\p{N}]/gu, ''); }
+
+function findDuplicateGroups(rows) {
+  const live = rows.filter((r) => r.syncStatus !== 'pending-delete');
+  const buckets = new Map();
+  for (const r of live) {
+    const usd = Number(r.amountUSD) || 0;
+    const twd = Number(r.amountTWD) || 0;
+    if (!usd && !twd) continue;
+    const key = `${r.date}|${usd}|${twd}`;
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(r);
+  }
+  const groups = [];
+  for (const recs of buckets.values()) {
+    if (recs.length < 2) continue;
+    const bySame = new Map();
+    for (const r of recs) {
+      const k = `${r.payer || ''}|${normItemKey(r.item)}`;
+      if (!bySame.has(k)) bySame.set(k, []);
+      bySame.get(k).push(r);
+    }
+    const leftovers = [];
+    for (const sub of bySame.values()) {
+      if (sub.length >= 2) groups.push({ level: 'strong', recs: sub });
+      else leftovers.push(...sub);
+    }
+    if (leftovers.length >= 2) groups.push({ level: 'weak', recs: leftovers });
+  }
+  for (const g of groups) g.id = g.recs.map((r) => r.localId).sort().join('+');
+  return groups
+    .filter((g) => !state.dupIgnored.includes(g.id))
+    .sort((a, b) => (a.level === b.level
+      ? (b.recs[0].date || '').localeCompare(a.recs[0].date || '')
+      : (a.level === 'strong' ? -1 : 1)));
+}
+
+let dupInfo = { groups: [], ids: new Set() };
+
+function refreshDupInfo(rows) {
+  const groups = findDuplicateGroups(rows);
+  dupInfo = { groups, ids: new Set(groups.flatMap((g) => g.recs.map((r) => r.localId))) };
+  const btn = $('#dupBtn');
+  if (btn) btn.textContent = groups.length ? `🔍 找出可能重複（${groups.length} 組）` : '🔍 找出可能重複';
+}
+
+async function openDupModal() {
+  const rows = await getAllExpenses();
+  const groups = findDuplicateGroups(rows);
+  const amountText = (r) => [hasAmount(r, 'amountUSD') ? usdText(r.amountUSD) : '', hasAmount(r, 'amountTWD') ? twdText(r.amountTWD) : ''].filter(Boolean).join(' ＋ ');
+  const recHtml = (r) => `
+    <div class="dup-rec">
+      <div class="dup-rec-main">
+        <div class="exp-title">${escapeHtml(r.item || '(未命名)')}</div>
+        <div class="exp-meta">${escapeHtml(r.payer || '未填付款人')}付　${escapeHtml(r.category || '')}　${escapeHtml(r.method || '')}${r.syncStatus && r.syncStatus.startsWith('pending') ? '　⏳待同步' : ''}</div>
+        ${r.note ? `<div class="exp-meta">${escapeHtml(r.note)}</div>` : ''}
+      </div>
+      <button class="icon-btn dup-del" data-del="${escapeHtml(r.localId)}">刪除這筆</button>
+    </div>`;
+  const section = (title, hint, list) => !list.length ? '' : `
+    <h4 class="dup-title">${title}</h4>
+    <p class="hint">${hint}</p>
+    ${list.map((g) => `
+      <div class="dup-card">
+        <div class="dup-head">${escapeHtml(g.recs[0].date || '')}　${escapeHtml(amountText(g.recs[0]))}</div>
+        ${g.recs.map(recHtml).join('')}
+        <button class="icon-btn" data-ignore="${escapeHtml(g.id)}">不是重複，忽略這組</button>
+      </div>`).join('')}`;
+
+  const strong = groups.filter((g) => g.level === 'strong');
+  const weak = groups.filter((g) => g.level === 'weak');
+  $('#modalRoot').innerHTML = `
+    <div class="modal-backdrop" id="modalBackdrop">
+      <div class="modal-sheet">
+        <h3>🔍 可能重複的紀錄</h3>
+        ${groups.length ? '' : '<div class="empty-state">沒有發現可能重複的紀錄 ✅</div>'}
+        ${section('很可能重複', '同一天、同付款人、同項目、同金額。刪掉重複的那筆會影響結算，請確認。', strong)}
+        ${section('金額相同，請確認', '同一天、金額相同，但項目或付款人不同，請自己確認是不是同一筆（例如兩個人都記了同一次消費）。', weak)}
+        <div class="modal-actions"><button class="cancel-btn" id="cancelBtn">關閉</button></div>
+      </div>
+    </div>`;
+  $('#modalBackdrop').addEventListener('click', async (e) => {
+    if (e.target.id === 'modalBackdrop') { closeModal(); return; }
+    const delId = e.target.dataset && e.target.dataset.del;
+    const ignoreId = e.target.dataset && e.target.dataset.ignore;
+    if (delId) {
+      if (!confirm('確定要刪除這筆記帳嗎？')) return;
+      await deleteExpense(delId);
+      await openDupModal();
+    } else if (ignoreId) {
+      state.dupIgnored.push(ignoreId);
+      await saveMeta('dupIgnored', state.dupIgnored);
+      await renderAll();
+      await openDupModal();
+    }
+  });
+  $('#cancelBtn').addEventListener('click', closeModal);
+}
+
+/* ---------- 同步狀態面板 ---------- */
+function fmtTime(iso) {
+  if (!iso) return '尚無紀錄';
+  const d = new Date(iso);
+  return isNaN(d) ? String(iso) : d.toLocaleString('zh-TW', { hour12: false });
+}
+
+// 哪些項目卡在待同步、為什麼，以及本機合計是怎麼組成的，
+// 讓「一直待同步」或「總額跟試算表對不上」可以直接在手機上診斷，而不是靠猜。
+async function renderSyncDiag() {
+  const box = $('#syncDiag');
+  if (!box) return;
+  const all = await idbGetAll(STORE_EXPENSES);
+  const live = all.filter((r) => r.syncStatus !== 'pending-delete');
+  const spent = live.filter((r) => r.category !== SETTLE_CATEGORY);
+  const repays = live.length - spent.length;
+  const pending = all.filter((r) => r.syncStatus && r.syncStatus.startsWith('pending'));
+  const label = { 'pending-create': '新增', 'pending-update': '修改', 'pending-delete': '刪除' };
+  const sumUSD = spent.reduce((s, r) => s + (Number(r.amountUSD) || 0), 0);
+  const sumTWD = spent.reduce((s, r) => s + (Number(r.amountTWD) || 0), 0);
+  const noAmount = spent.filter((r) => !hasAmount(r, 'amountUSD') && !hasAmount(r, 'amountTWD'));
+
+  let html = '';
+  if (!state.syncUrl) html += '<div class="diag-error">尚未設定同步網址，資料只存在這支手機上。</div>';
+  if (state.lastSyncError) {
+    html += `<div class="diag-error">最近一次同步失敗（${escapeHtml(fmtTime(state.lastSyncError.at))}）：${escapeHtml(state.lastSyncError.message)}</div>`;
+  }
+  html += `<div class="hint">最近一次成功同步：${escapeHtml(fmtTime(state.lastSyncOk))}</div>`;
+  html += `<div class="hint">本機共 ${spent.length} 筆消費${repays ? `（另有 ${repays} 筆還款）` : ''}・美金合計 ${usdText(sumUSD)}・台幣合計 ${twdText(sumTWD)}</div>`;
+  if (noAmount.length) {
+    html += `<div class="hint">其中 ${noAmount.length} 筆沒有任何金額（不計入合計）：${escapeHtml(noAmount.slice(0, 5).map((r) => r.item || '(未命名)').join('、'))}${noAmount.length > 5 ? '…' : ''}</div>`;
+  }
+
+  if (!pending.length && !state.pendingOptions.length) {
+    html += '<div class="hint">目前沒有待同步項目 ✅</div>';
+  } else {
+    html += '<div class="diag-list">';
+    for (const r of pending) {
+      const err = state.syncErrors[r.localId];
+      const amt = [hasAmount(r, 'amountUSD') ? usdText(r.amountUSD) : '', hasAmount(r, 'amountTWD') ? twdText(r.amountTWD) : ''].filter(Boolean).join(' ＋ ');
+      html += `<div class="diag-item">
+        <div><span class="diag-tag">${label[r.syncStatus] || '待處理'}</span> ${escapeHtml(r.date || '')} ${escapeHtml(r.item || '(未命名)')} ${escapeHtml(amt)}${r.sheetRow ? `（試算表第 ${r.sheetRow} 列）` : ''}</div>
+        ${err ? `<div class="diag-error">失敗原因：${escapeHtml(err.message)}</div>` : '<div class="hint">還沒收到失敗訊息（可能還沒輪到或正在同步）</div>'}
+        <button class="icon-btn" data-discard="${escapeHtml(r.localId)}">放棄同步這筆</button>
+      </div>`;
+    }
+    state.pendingOptions.forEach((o, i) => {
+      const err = state.syncErrors['opt:' + o.field + ':' + o.value];
+      html += `<div class="diag-item">
+        <div><span class="diag-tag">選項</span> ${o.field === 'category' ? '分類' : '付款方式'}：${escapeHtml(o.value)}</div>
+        ${err ? `<div class="diag-error">失敗原因：${escapeHtml(err.message)}</div>` : '<div class="hint">還沒收到失敗訊息</div>'}
+        <button class="icon-btn" data-discard-opt="${i}">放棄寫入試算表下拉選單</button>
+      </div>`;
+    });
+    html += '</div>';
+  }
+  box.innerHTML = html;
+}
+
+async function discardPending(localId) {
+  const rec = (await idbGetAll(STORE_EXPENSES)).find((r) => r.localId === localId);
+  if (!rec) return;
+  // 新增／刪除：試算表本來就沒有或不該有它，直接從本機移除。修改：保留本機的值，只是不再重試。
+  if (rec.syncStatus === 'pending-update') {
+    rec.syncStatus = 'synced';
+    await idbPut(STORE_EXPENSES, rec);
+  } else {
+    await idbDelete(STORE_EXPENSES, localId);
+  }
+  delete state.syncErrors[localId];
+  await renderAll();
+}
+
+function wireSyncDiag() {
+  $('#syncDiag').addEventListener('click', async (e) => {
+    const id = e.target.dataset && e.target.dataset.discard;
+    const optIdx = e.target.dataset && e.target.dataset.discardOpt;
+    if (id) {
+      if (!confirm('放棄後這筆不會再嘗試同步。確定嗎？')) return;
+      await discardPending(id);
+    } else if (optIdx !== undefined) {
+      if (!confirm('放棄後這個新選項不會寫進試算表的下拉選單（本機仍可使用）。確定嗎？')) return;
+      state.pendingOptions.splice(Number(optIdx), 1);
+      await saveMeta('pendingOptions', state.pendingOptions);
+      await renderAll();
+    }
+  });
+  $('#retrySyncBtn').addEventListener('click', () => {
+    if (!state.syncUrl) { showToast('請先設定 Apps Script 網址'); return; }
+    runSync();
+  });
+  $('#fullResyncBtn').addEventListener('click', async () => {
+    if (!state.syncUrl) { showToast('請先設定 Apps Script 網址'); return; }
+    if (!confirm('會以試算表為準重建手機上的紀錄：已同步的紀錄改成跟試算表一致，試算表上已不存在的會從手機移除；尚未同步的本機變更會保留。確定嗎？')) return;
+    state.lastPullTime = '';
+    await saveMeta('lastPullTime', '');
+    runSync();
+  });
 }
 
 /* ---------- rendering ---------- */
 async function renderAll() {
   const rows = await getAllExpenses();
+  refreshDupInfo(rows);
   renderSummary(rows);
   renderList(rows);
   renderWho();
   await updateSyncBadge();
+  await renderSyncDiag();
 }
 
 const hasAmount = (r, field) => { const n = Number(r[field]); return Number.isFinite(n) && n !== 0; };
@@ -422,7 +712,8 @@ function amountHtml(r) {
   return `${usd || twd}${usd && twd ? `<small>${twd}</small>` : ''}`;
 }
 
-function renderSummary(rows) {
+function renderSummary(allRows) {
+  const rows = allRows.filter((r) => r.syncStatus !== 'pending-delete'); // 已排隊刪除的，從使用者角度已經不存在，不能再算進結算
   // 美金、台幣各自獨立計算（不換算匯率）。
   const usd = computeBalances(rows, state.people, 'amountUSD');
   const twd = computeBalances(rows, state.people, 'amountTWD');
@@ -507,6 +798,7 @@ function renderList(rows) {
             <div class="exp-meta">
               ${tags}
               ${pending ? '<span class="exp-tag pending-tag">待同步</span>' : ''}
+              ${dupInfo.ids.has(r.localId) ? '<span class="exp-tag dup-tag">⚠️可能重複</span>' : ''}
               ${r.note ? '　' + escapeHtml(r.note) : ''}
             </div>
           </div>
@@ -1018,9 +1310,11 @@ async function init() {
   await loadMeta();
   wireSettings();
   wireTabs();
+  wireSyncDiag();
   loadAppsScriptCode();
   $('#addFab').addEventListener('click', () => openExpenseModal(null));
   $('#importBtn').addEventListener('click', openImportModal);
+  $('#dupBtn').addEventListener('click', openDupModal);
   $('#syncBadge').addEventListener('click', () => {
     if (state.syncUrl) runSync();
     else switchTab('tab-settings');

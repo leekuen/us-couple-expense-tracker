@@ -169,7 +169,10 @@ function doGet(e) {
 /* ---------- helpers ---------- */
 function isOldLayout_(sheet) {
   // 舊版（沒有台幣欄）的特徵：第 7 欄標題是「付款人負擔比例」。
-  return String(sheet.getRange(1, 7).getValue()).indexOf(OLD_SHARE_HEADER) !== -1;
+  if (String(sheet.getRange(1, 7).getValue()).indexOf(OLD_SHARE_HEADER) !== -1) return true;
+  // 舊版表格的前 8 欄標題可能是空的（只有同步用的欄位有標題），這時第 7 欄標題判斷不出來。
+  // 舊版的「最後修改時間」在第 9 欄，新版第 9 欄是「備註」，用這個當第二個依據。
+  return String(sheet.getRange(1, 9).getValue()).indexOf('最後修改時間') !== -1;
 }
 
 function assertDataRow_(row) {

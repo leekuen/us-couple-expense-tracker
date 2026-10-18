@@ -47,6 +47,7 @@
       </div>
 
       <button class="btn-secondary" id="importBtn">📸 從截圖匯入消費</button>
+      <button class="btn-secondary" id="dupBtn">🔍 找出可能重複</button>
 
       <div id="expenseList"></div>
     </div>
@@ -89,6 +90,14 @@
           </ol>
           <p class="hint">⚠️ 不要用 Apps Script 編輯器上方的「執行」按鈕測試 <code>doPost</code>，那樣不會送出網路請求。「💸 還款」是結算用的特殊分類，請不要在試算表改名。</p>
         </details>
+      </div>
+
+      <div class="card" id="syncDiagCard">
+        <h2>🔍 同步狀態</h2>
+        <div id="syncDiag"></div>
+        <button class="btn-secondary" id="retrySyncBtn">🔄 立即重試同步</button>
+        <button class="btn-secondary" id="fullResyncBtn">⬇️ 重新從試算表抓取全部紀錄</button>
+        <p class="hint">提醒：在試算表裡想移除一筆時，請只清空那一列的內容，不要用「刪除列」，否則下面所有列的列號會往上移，兩支手機記住的對應就會錯位。</p>
       </div>
 
       <div class="card">
