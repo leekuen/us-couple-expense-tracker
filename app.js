@@ -672,66 +672,112 @@ function looseKey(r) { return [r.date, r.payer || '', Number(r.amountUSD) || 0, 
 async function findLocalMissingFromSheet() {
   const res = await callSync('pull', { since: '' });
   if (!Array.isArray(res.people)) throw new Error('後端程式碼不是雙人記帳版');
-  const sheetRows = res.rows.filter((r) => !r.deleted).map((r) => ({ ...r.data, date: normalizeRemoteDate(r.data && r.data.date) }));
-  const locals = (await getAllExpenses()).filter((r) =>
-    (r.syncStatus === 'synced' || r.syncStatus === 'pending-update') && (Number(r.amountUSD) || Number(r.amountTWD)));
+  const sheetRows = res.rows.filter((r) => !r.deleted).map((r) => ({
+    ...r.data, date: normalizeRemoteDate(r.data && r.data.date), _row: r.row, _lm: r.lastModified,
+  }));
+  const all = await getAllExpenses();
+  const hasAmt = (r) => Number(r.amountUSD) || Number(r.amountTWD);
+  const locals = all.filter((r) => (r.syncStatus === 'synced' || r.syncStatus === 'pending-update') && hasAmt(r));
   const used = new Set();
   const take = (keyFn, local) => {
     const k = keyFn(local);
-    const i = sheetRows.findIndex((s, idx) => !used.has(idx) && (Number(s.amountUSD) || Number(s.amountTWD)) && keyFn(s) === k);
+    const i = sheetRows.findIndex((s, idx) => !used.has(idx) && hasAmt(s) && keyFn(s) === k);
     if (i === -1) return false;
     used.add(i);
     return true;
   };
   let remaining = locals.filter((l) => !take(contentKey, l));
   remaining = remaining.filter((l) => !take(looseKey, l)); // 項目名稱被改過的，日期、付款人、金額對得上就當作有
-  return { missing: remaining, sheetCount: sheetRows.length, matched: locals.length - remaining.length };
+  // 排隊中的新增／刪除也先認領對得上的試算表列，這樣它們不會被當成「試算表有、手機沒有」。
+  for (const o of all.filter((r) => (r.syncStatus === 'pending-delete' || r.syncStatus === 'pending-create') && hasAmt(r))) {
+    if (!take(contentKey, o)) take(looseKey, o);
+  }
+  const sheetOnly = sheetRows.filter((s, i) => !used.has(i) && hasAmt(s));
+  return { missing: remaining, sheetOnly, sheetCount: sheetRows.length, matched: locals.length - remaining.length };
 }
 
 function openCompareModal(result, intro) {
-  const { missing } = result;
+  const { missing, sheetOnly } = result;
   const amt = (r) => [hasAmount(r, 'amountUSD') ? usdText(r.amountUSD) : '', hasAmount(r, 'amountTWD') ? twdText(r.amountTWD) : ''].filter(Boolean).join(' ＋ ');
+  const rowHtml = (r, i, attr, extra) => `
+    <label class="import-row">
+      <input type="checkbox" ${attr}="${i}" checked>
+      <div class="import-main">
+        <div class="exp-title">${escapeHtml(r.item || '(未命名)')}</div>
+        <div class="exp-meta">${escapeHtml(r.date || '')}　${escapeHtml(r.payer || '未填付款人')}付　${escapeHtml(r.category || '')}　${escapeHtml(r.method || '')}${extra || ''}</div>
+      </div>
+      <div class="exp-amount">${escapeHtml(amt(r))}</div>
+    </label>`;
+  const allOk = !missing.length && !sheetOnly.length;
   $('#modalRoot').innerHTML = `
     <div class="modal-backdrop" id="modalBackdrop">
       <div class="modal-sheet">
-        <h3>🔎 手機有、試算表找不到</h3>
-        <p class="hint">${escapeHtml(intro || '')}手機上 ${result.matched + missing.length} 筆已同步的紀錄中，有 <b>${missing.length}</b> 筆在試算表找不到對應的列（試算表共 ${result.sheetCount} 筆）。</p>
-        ${missing.length ? `<div id="missingList">${missing.map((r, i) => `
-          <label class="import-row">
-            <input type="checkbox" data-i="${i}" checked>
-            <div class="import-main">
-              <div class="exp-title">${escapeHtml(r.item || '(未命名)')}</div>
-              <div class="exp-meta">${escapeHtml(r.date || '')}　${escapeHtml(r.payer || '未填付款人')}付　${escapeHtml(r.category || '')}　${escapeHtml(r.method || '')}</div>
-            </div>
-            <div class="exp-amount">${escapeHtml(amt(r))}</div>
-          </label>`).join('')}</div>` : '<div class="empty-state">手機和試算表對得上 ✅</div>'}
+        <h3>🔎 手機與試算表比對</h3>
+        <p class="hint">${escapeHtml(intro || '')}手機上 ${result.matched + missing.length} 筆已同步的紀錄，試算表共 ${result.sheetCount} 筆。</p>
+        ${allOk ? '<div class="empty-state">兩邊對得上 ✅</div>' : ''}
+        ${missing.length ? `
+          <h4 class="dup-title">手機有、試算表找不到（${missing.length} 筆）</h4>
+          <p class="hint">勾選後可以補寫回試算表。</p>
+          <div id="missingList">${missing.map((r, i) => rowHtml(r, i, 'data-i')).join('')}</div>` : ''}
+        ${sheetOnly.length ? `
+          <h4 class="dup-title">試算表有、手機沒有（${sheetOnly.length} 筆）</h4>
+          <p class="hint">例如直接在試算表手動新增的列，或另一支手機剛記的。通常按「立即重試同步」就會自動抓下來；如果同步抓不到，勾選後可以直接加到手機。</p>
+          <div id="sheetOnlyList">${sheetOnly.map((r, i) => rowHtml(r, i, 'data-s', `　（試算表第 ${r._row} 列）`)).join('')}</div>` : ''}
         <div class="modal-actions">
           <button class="cancel-btn" id="cancelBtn">關閉</button>
           ${missing.length ? '<button class="save-btn" id="restoreBtn"></button>' : ''}
+          ${sheetOnly.length ? '<button class="save-btn" id="addToPhoneBtn"></button>' : ''}
         </div>
       </div>
     </div>`;
   $('#cancelBtn').addEventListener('click', closeModal);
   $('#modalBackdrop').addEventListener('click', (e) => { if (e.target.id === 'modalBackdrop') closeModal(); });
-  if (!missing.length) return;
-  const selected = () => [...document.querySelectorAll('#missingList input:checked')].map((el) => missing[Number(el.dataset.i)]);
-  const refresh = () => { const n = selected().length; const b = $('#restoreBtn'); b.textContent = `補寫回試算表（${n} 筆）`; b.disabled = n === 0; };
-  refresh();
-  $('#missingList').addEventListener('change', refresh);
-  $('#restoreBtn').addEventListener('click', async () => {
-    const chosen = selected();
-    if (!chosen.length) return;
-    // 換新的 localId：舊 localId 可能還留在試算表那列的「本機記錄ID」欄，
-    // 後端會把它當成「已經建立過」而只回傳那個空白列、不會把內容寫回去。
-    for (const rec of chosen) {
-      await idbPut(STORE_EXPENSES, { ...rec, localId: uid(), sheetRow: null, syncStatus: 'pending-create', lastModified: nowISO() });
-      await idbDelete(STORE_EXPENSES, rec.localId);
-    }
-    closeModal();
-    await renderAll();
-    showToast(`已排入補寫 ${chosen.length} 筆，同步中…`);
-    runSync();
-  });
+
+  if (missing.length) {
+    const selected = () => [...document.querySelectorAll('#missingList input:checked')].map((el) => missing[Number(el.dataset.i)]);
+    const refresh = () => { const n = selected().length; const b = $('#restoreBtn'); b.textContent = `補寫回試算表（${n} 筆）`; b.disabled = n === 0; };
+    refresh();
+    $('#missingList').addEventListener('change', refresh);
+    $('#restoreBtn').addEventListener('click', async () => {
+      const chosen = selected();
+      if (!chosen.length) return;
+      // 換新的 localId：舊 localId 可能還留在試算表那列的「本機記錄ID」欄，
+      // 後端會把它當成「已經建立過」而只回傳那個空白列、不會把內容寫回去。
+      for (const rec of chosen) {
+        await idbPut(STORE_EXPENSES, { ...rec, localId: uid(), sheetRow: null, syncStatus: 'pending-create', lastModified: nowISO() });
+        await idbDelete(STORE_EXPENSES, rec.localId);
+      }
+      closeModal();
+      await renderAll();
+      showToast(`已排入補寫 ${chosen.length} 筆，同步中…`);
+      runSync();
+    });
+  }
+
+  if (sheetOnly.length) {
+    const selectedS = () => [...document.querySelectorAll('#sheetOnlyList input:checked')].map((el) => sheetOnly[Number(el.dataset.s)]);
+    const refreshS = () => { const n = selectedS().length; const b = $('#addToPhoneBtn'); b.textContent = `加到手機（${n} 筆）`; b.disabled = n === 0; };
+    refreshS();
+    $('#sheetOnlyList').addEventListener('change', refreshS);
+    $('#addToPhoneBtn').addEventListener('click', async () => {
+      const chosen = selectedS();
+      if (!chosen.length) return;
+      // 手機上已經有紀錄記著同一個列號時不硬塞（那會讓兩筆共用一列，之後編輯／刪除會動到對方），
+      // 請使用者先處理上面「手機有、試算表找不到」的項目。
+      const taken = new Set((await idbGetAll(STORE_EXPENSES)).filter((r) => r.sheetRow).map((r) => r.sheetRow));
+      let added = 0;
+      let skipped = 0;
+      for (const s of chosen) {
+        if (taken.has(s._row)) { skipped++; continue; }
+        const { _row, _lm, ...data } = s;
+        await idbPut(STORE_EXPENSES, { localId: uid(), ...data, lastModified: _lm || nowISO(), sheetRow: _row, syncStatus: 'synced' });
+        added++;
+      }
+      closeModal();
+      await renderAll();
+      showToast(`已加到手機 ${added} 筆${skipped ? `，${skipped} 筆因列號衝突略過（請先處理手機有、試算表沒有的項目）` : ''}`);
+    });
+  }
 }
 
 async function runCompare(intro) {
