@@ -663,7 +663,93 @@ async function discardPending(localId) {
   await renderAll();
 }
 
+/* ---------- 比對手機與試算表（找出「手機有、試算表沒有」的紀錄） ---------- */
+// 用內容（日期＋付款人＋項目＋金額）而不是列號比對：列號在試算表被刪列、或曾經對錯列之後就不可靠了。
+// 只讀取，不會改動任何東西；補寫回去要使用者按了才做。
+function contentKey(r) { return [r.date, r.payer || '', normItemKey(r.item), Number(r.amountUSD) || 0, Number(r.amountTWD) || 0].join('|'); }
+function looseKey(r) { return [r.date, r.payer || '', Number(r.amountUSD) || 0, Number(r.amountTWD) || 0].join('|'); }
+
+async function findLocalMissingFromSheet() {
+  const res = await callSync('pull', { since: '' });
+  if (!Array.isArray(res.people)) throw new Error('後端程式碼不是雙人記帳版');
+  const sheetRows = res.rows.filter((r) => !r.deleted).map((r) => ({ ...r.data, date: normalizeRemoteDate(r.data && r.data.date) }));
+  const locals = (await getAllExpenses()).filter((r) =>
+    (r.syncStatus === 'synced' || r.syncStatus === 'pending-update') && (Number(r.amountUSD) || Number(r.amountTWD)));
+  const used = new Set();
+  const take = (keyFn, local) => {
+    const k = keyFn(local);
+    const i = sheetRows.findIndex((s, idx) => !used.has(idx) && (Number(s.amountUSD) || Number(s.amountTWD)) && keyFn(s) === k);
+    if (i === -1) return false;
+    used.add(i);
+    return true;
+  };
+  let remaining = locals.filter((l) => !take(contentKey, l));
+  remaining = remaining.filter((l) => !take(looseKey, l)); // 項目名稱被改過的，日期、付款人、金額對得上就當作有
+  return { missing: remaining, sheetCount: sheetRows.length, matched: locals.length - remaining.length };
+}
+
+function openCompareModal(result, intro) {
+  const { missing } = result;
+  const amt = (r) => [hasAmount(r, 'amountUSD') ? usdText(r.amountUSD) : '', hasAmount(r, 'amountTWD') ? twdText(r.amountTWD) : ''].filter(Boolean).join(' ＋ ');
+  $('#modalRoot').innerHTML = `
+    <div class="modal-backdrop" id="modalBackdrop">
+      <div class="modal-sheet">
+        <h3>🔎 手機有、試算表找不到</h3>
+        <p class="hint">${escapeHtml(intro || '')}手機上 ${result.matched + missing.length} 筆已同步的紀錄中，有 <b>${missing.length}</b> 筆在試算表找不到對應的列（試算表共 ${result.sheetCount} 筆）。</p>
+        ${missing.length ? `<div id="missingList">${missing.map((r, i) => `
+          <label class="import-row">
+            <input type="checkbox" data-i="${i}" checked>
+            <div class="import-main">
+              <div class="exp-title">${escapeHtml(r.item || '(未命名)')}</div>
+              <div class="exp-meta">${escapeHtml(r.date || '')}　${escapeHtml(r.payer || '未填付款人')}付　${escapeHtml(r.category || '')}　${escapeHtml(r.method || '')}</div>
+            </div>
+            <div class="exp-amount">${escapeHtml(amt(r))}</div>
+          </label>`).join('')}</div>` : '<div class="empty-state">手機和試算表對得上 ✅</div>'}
+        <div class="modal-actions">
+          <button class="cancel-btn" id="cancelBtn">關閉</button>
+          ${missing.length ? '<button class="save-btn" id="restoreBtn"></button>' : ''}
+        </div>
+      </div>
+    </div>`;
+  $('#cancelBtn').addEventListener('click', closeModal);
+  $('#modalBackdrop').addEventListener('click', (e) => { if (e.target.id === 'modalBackdrop') closeModal(); });
+  if (!missing.length) return;
+  const selected = () => [...document.querySelectorAll('#missingList input:checked')].map((el) => missing[Number(el.dataset.i)]);
+  const refresh = () => { const n = selected().length; const b = $('#restoreBtn'); b.textContent = `補寫回試算表（${n} 筆）`; b.disabled = n === 0; };
+  refresh();
+  $('#missingList').addEventListener('change', refresh);
+  $('#restoreBtn').addEventListener('click', async () => {
+    const chosen = selected();
+    if (!chosen.length) return;
+    // 換新的 localId：舊 localId 可能還留在試算表那列的「本機記錄ID」欄，
+    // 後端會把它當成「已經建立過」而只回傳那個空白列、不會把內容寫回去。
+    for (const rec of chosen) {
+      await idbPut(STORE_EXPENSES, { ...rec, localId: uid(), sheetRow: null, syncStatus: 'pending-create', lastModified: nowISO() });
+      await idbDelete(STORE_EXPENSES, rec.localId);
+    }
+    closeModal();
+    await renderAll();
+    showToast(`已排入補寫 ${chosen.length} 筆，同步中…`);
+    runSync();
+  });
+}
+
+async function runCompare(intro) {
+  if (!state.syncUrl) { showToast('請先設定 Apps Script 網址'); return null; }
+  if (!navigator.onLine) { showToast('比對需要連線'); return null; }
+  try {
+    showToast('比對中…');
+    const result = await findLocalMissingFromSheet();
+    openCompareModal(result, intro);
+    return result;
+  } catch (e) {
+    showToast('比對失敗：' + e.message);
+    return null;
+  }
+}
+
 function wireSyncDiag() {
+  $('#compareBtn').addEventListener('click', () => runCompare(''));
   $('#syncDiag').addEventListener('click', async (e) => {
     const id = e.target.dataset && e.target.dataset.discard;
     const optIdx = e.target.dataset && e.target.dataset.discardOpt;
@@ -683,7 +769,13 @@ function wireSyncDiag() {
   });
   $('#fullResyncBtn').addEventListener('click', async () => {
     if (!state.syncUrl) { showToast('請先設定 Apps Script 網址'); return; }
-    if (!confirm('會以試算表為準重建手機上的紀錄：已同步的紀錄改成跟試算表一致，試算表上已不存在的會從手機移除；尚未同步的本機變更會保留。確定嗎？')) return;
+    // 重新抓取會用試算表的內容覆蓋手機、並移除試算表沒有的列。如果試算表曾經少了列，
+    // 手機上那些紀錄會就此消失，所以先比對，有「手機有、試算表沒有」的就停下來讓使用者處理。
+    const result = await runCompare('重新抓取之前，請先處理下面這些，否則它們會被覆蓋掉。');
+    if (!result) return;
+    if (result.missing.length) return;
+    closeModal();
+    if (!confirm('手機和試算表對得上。會以試算表為準重建手機上的紀錄（尚未同步的本機變更會保留）。確定嗎？')) return;
     state.lastPullTime = '';
     await saveMeta('lastPullTime', '');
     runSync();

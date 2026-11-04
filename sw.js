@@ -1,5 +1,5 @@
 const CACHE_PREFIX = 'couple-expense-shell-';
-const CACHE_NAME = CACHE_PREFIX + 'v5';
+const CACHE_NAME = CACHE_PREFIX + 'v6';
 const SHELL_FILES = ['./', './index.html', './style.css', './app.js', './manifest.json', './icon.svg', './apps-script.gs'];
 
 self.addEventListener('install', (event) => {
